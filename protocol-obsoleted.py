@@ -2,7 +2,6 @@ import json
 import base64
 import logging
 
-from fastapi import logger
 
 class JsonRpcProtocol:
     def __init__(self, crypto_manager):
