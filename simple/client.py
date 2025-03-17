@@ -9,6 +9,8 @@ import json
 import uuid
 import time
 from urllib.parse import urlparse
+import concurrent.futures
+import queue
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -23,10 +25,40 @@ class HTTPSTunnelProxy:
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sessions = {}  # 存储客户端会话信息
+        self.session_locks = {}  # 会话锁，确保并发安全
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=100)  # 线程池
+        cleanup_thread = threading.Thread(target=self.cleanup_sessions, daemon=True)
+        cleanup_thread.start()
+    def cleanup_sessions(self):
+        while True:
+            time.sleep(60)  # 每分钟检查一次
+            try:
+                current_time = time.time()
+                expired_sessions = []
+                
+                # 获取会话ID列表的副本避免并发修改
+                session_ids = list(self.sessions.keys())
+                
+                for session_id in session_ids:
+                    try:
+                        if session_id in self.sessions:
+                            with self.session_locks.get(session_id, threading.Lock()):
+                                # 如果会话超过5分钟没有活动，则关闭
+                                if current_time - self.sessions[session_id]["last_activity"] > 300:
+                                    expired_sessions.append(session_id)
+                    except Exception as e:
+                        logger.error(f"检查会话 {session_id} 过期时出错: {e}")
+                
+                # 关闭过期会话
+                for session_id in expired_sessions:
+                    self.close_session(session_id)
+                    
+            except Exception as e:
+                logger.error(f"清理会话时出错: {e}")
         
     def start(self):
         self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
+        self.server_socket.listen(100)  # 增加监听队列大小
         logger.info(f"隧道代理客户端已在 {self.host}:{self.port} 启动")
         logger.info(f"连接到服务端: {self.server_url}")
         
@@ -34,13 +66,13 @@ class HTTPSTunnelProxy:
             while True:
                 client_socket, client_address = self.server_socket.accept()
                 logger.info(f"接收到来自 {client_address[0]}:{client_address[1]} 的连接")
-                client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
-                client_thread.daemon = True
-                client_thread.start()
+                # 使用线程池处理新连接
+                self.executor.submit(self.handle_client, client_socket)
         except KeyboardInterrupt:
             logger.info("正在关闭代理客户端...")
         finally:
             self.server_socket.close()
+            self.executor.shutdown(wait=False)  # 关闭线程池
     
     def encode_data(self, data):
         """将数据编码为Base64"""
@@ -85,6 +117,12 @@ class HTTPSTunnelProxy:
         session_id = str(uuid.uuid4())
         
         try:
+            # 设置客户端socket为非阻塞
+            client_socket.setblocking(False)
+            
+            # 优化socket参数
+            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
             # 向服务端发起连接请求
             establish_data = {
                 "host": host,
@@ -92,7 +130,11 @@ class HTTPSTunnelProxy:
                 "session_id": session_id
             }
             
-            response = requests.post(
+            # 设置连接超时
+            session = requests.Session()
+            session.timeout = (5, 30)  # 连接超时和读超时
+            
+            response = session.post(
                 f"{self.server_url}/establish",
                 json={"data": self.encode_data(establish_data)},
                 verify=self.verify_ssl
@@ -116,15 +158,16 @@ class HTTPSTunnelProxy:
             # 发送连接成功响应给客户端
             client_socket.send(b'HTTP/1.1 200 Connection Established\r\n\r\n')
             
-            # 设置客户端socket为非阻塞
-            client_socket.setblocking(False)
+            # 创建会话锁
+            self.session_locks[session_id] = threading.Lock()
             
             # 存储会话信息
             self.sessions[session_id] = {
                 "client_socket": client_socket,
                 "host": host,
                 "port": port,
-                "last_activity": time.time()
+                "last_activity": time.time(),
+                "buffer": bytearray()
             }
             
             # 启动数据传输
@@ -148,21 +191,57 @@ class HTTPSTunnelProxy:
     
     def tunnel_data(self, client_socket, session_id):
         try:
-            while True:
+            # 创建两个线程分别处理双向数据流
+            client_to_server = threading.Thread(
+                target=self.handle_client_to_server,
+                args=(client_socket, session_id)
+            )
+            server_to_client = threading.Thread(
+                target=self.handle_server_to_client,
+                args=(client_socket, session_id)
+            )
+            
+            client_to_server.daemon = True
+            server_to_client.daemon = True
+            
+            client_to_server.start()
+            server_to_client.start()
+            
+            # 等待任意一个线程结束
+            while client_to_server.is_alive() and server_to_client.is_alive():
+                time.sleep(0.1)
+                
+        except Exception as e:
+            logger.error(f"隧道数据传输时出错: {e}")
+        
+        finally:
+            # 关闭连接
+            self.close_session(session_id)
+    
+    def handle_client_to_server(self, client_socket, session_id):
+        """处理从客户端到服务端的数据流"""
+        buffer_size = 16384  # 增大缓冲区
+        
+        try:
+            while session_id in self.sessions:
                 # 使用select监听客户端socket
-                readable, _, exceptional = select.select([client_socket], [], [client_socket], 1)
+                readable, _, exceptional = select.select([client_socket], [], [client_socket], 0.5)
                 
                 if exceptional:
-                    logger.info(f"连接出现异常，结束会话 {session_id}")
+                    logger.info(f"客户端连接异常，结束会话 {session_id}")
                     break
-                
+                    
                 if client_socket in readable:
                     # 从客户端读取数据
                     try:
-                        client_data = client_socket.recv(8192)
+                        client_data = client_socket.recv(buffer_size)
                         if not client_data:
                             logger.info(f"客户端连接已关闭，结束会话 {session_id}")
                             break
+                        
+                        # 加锁确保安全
+                        with self.session_locks[session_id]:
+                            self.sessions[session_id]["last_activity"] = time.time()
                         
                         # 编码数据并发送到服务端
                         transfer_data = {
@@ -171,10 +250,13 @@ class HTTPSTunnelProxy:
                             "payload": base64.b64encode(client_data).decode('utf-8')
                         }
                         
-                        response = requests.post(
+                        # 使用Session对象提高连接复用
+                        session = requests.Session()
+                        response = session.post(
                             f"{self.server_url}/transfer",
                             json={"data": self.encode_data(transfer_data)},
-                            verify=self.verify_ssl
+                            verify=self.verify_ssl,
+                            timeout=(5, 30)
                         )
                         
                         if response.status_code != 200:
@@ -185,70 +267,100 @@ class HTTPSTunnelProxy:
                         response_data = self.decode_data(response.json()["data"])
                         
                         if response_data["status"] != "success":
-                            logger.error(f"服务端报告错误: {response_data.get('message', 'Unknown error')}")
+                            logger.error(f"服务端报告错误: {response_data.get('message')}")
                             break
                         
                         # 将服务端响应发送给客户端
-                        server_response = base64.b64decode(response_data["payload"])
-                        if server_response:
-                            client_socket.sendall(server_response)
+                        if response_data.get("payload"):
+                            server_response = base64.b64decode(response_data["payload"])
+                            if server_response and session_id in self.sessions:
+                                client_socket.sendall(server_response)
                     
                     except ConnectionError:
                         logger.info(f"客户端连接已关闭，结束会话 {session_id}")
                         break
-                
-                # 定期从服务端检查是否有数据
-                else:
-                    try:
-                        poll_data = {
-                            "session_id": session_id,
-                            "direction": "from_server",
-                            "payload": ""
-                        }
-                        
-                        response = requests.post(
-                            f"{self.server_url}/transfer",
-                            json={"data": self.encode_data(poll_data)},
-                            verify=self.verify_ssl
-                        )
-                        
-                        if response.status_code == 200:
-                            response_data = self.decode_data(response.json()["data"])
-                            
-                            if response_data["status"] == "success" and response_data.get("payload"):
-                                server_data = base64.b64decode(response_data["payload"])
-                                if server_data:
-                                    client_socket.sendall(server_data)
-                    
                     except Exception as e:
-                        logger.error(f"从服务端轮询数据时出错: {e}")
-                        # 轮询出错不终止连接
-        
+                        logger.error(f"处理客户端数据时出错: {e}")
+                        break
         except Exception as e:
-            logger.error(f"隧道数据传输时出错: {e}")
-        
-        finally:
-            # 关闭连接
+            logger.error(f"客户端到服务端数据传输线程出错: {e}")
+    
+    def handle_server_to_client(self, client_socket, session_id):
+        """处理从服务端到客户端的数据流"""
+        try:
+            while session_id in self.sessions:
+                try:
+                    # 加锁确保安全
+                    with self.session_locks[session_id]:
+                        self.sessions[session_id]["last_activity"] = time.time()
+                    
+                    # 从服务端轮询数据
+                    poll_data = {
+                        "session_id": session_id,
+                        "direction": "from_server",
+                        "payload": base64.b64encode(b"").decode('utf-8')  # 发送空数据
+                    }
+                    
+                    # 使用Session对象提高连接复用
+                    session = requests.Session()
+                    response = session.post(
+                        f"{self.server_url}/transfer",
+                        json={"data": self.encode_data(poll_data)},
+                        verify=self.verify_ssl,
+                        timeout=(2, 10)  # 较短的超时
+                    )
+                    
+                    if response.status_code == 200:
+                        response_data = self.decode_data(response.json()["data"])
+                        
+                        if response_data["status"] == "success" and response_data.get("payload"):
+                            server_data = base64.b64decode(response_data["payload"])
+                            if server_data and session_id in self.sessions:
+                                client_socket.sendall(server_data)
+                    
+                    # 轮询间隔，避免过于频繁
+                    time.sleep(0.05)
+                
+                except requests.Timeout:
+                    # 超时不是致命错误，继续尝试
+                    continue
+                except Exception as e:
+                    logger.error(f"从服务端轮询数据时出错: {e}")
+                    # 轮询出错不终止连接，但增加延迟
+                    time.sleep(1)
+        except Exception as e:
+            logger.error(f"服务端到客户端数据传输线程出错: {e}")
+
+    def close_session(self, session_id):
+        """安全地关闭一个会话"""
+        if session_id in self.sessions:
             try:
-                client_socket.close()
-            except:
-                pass
-            
-            # 通知服务端关闭连接
-            try:
+                # 加锁确保并发安全
+                if session_id in self.session_locks:
+                    with self.session_locks[session_id]:
+                        client_socket = self.sessions[session_id]["client_socket"]
+                        try:
+                            client_socket.close()
+                        except:
+                            pass
+                        del self.sessions[session_id]
+                        
+                    # 删除会话锁
+                    del self.session_locks[session_id]
+                    
+                # 通知服务端关闭连接
                 close_data = {"session_id": session_id}
                 requests.post(
                     f"{self.server_url}/close",
                     json={"data": self.encode_data(close_data)},
-                    verify=self.verify_ssl
+                    verify=self.verify_ssl,
+                    timeout=5
                 )
+                
+                logger.info(f"已关闭会话 {session_id}")
+                
             except Exception as e:
-                logger.error(f"通知服务端关闭连接时出错: {e}")
-            
-            # 清理会话
-            if session_id in self.sessions:
-                del self.sessions[session_id]
-                logger.info(f"已清理会话 {session_id}")
+                logger.error(f"关闭会话 {session_id} 时出错: {e}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='HTTPS隧道代理客户端')

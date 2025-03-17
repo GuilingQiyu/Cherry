@@ -1,10 +1,14 @@
+
 import base64
 import json
 import socket
 import threading
 import logging
+import asyncio
+import time
 from typing import Dict
-
+import concurrent.futures
+from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -19,6 +23,8 @@ app = FastAPI(title="HTTPS隧道代理服务端")
 
 # 创建会话存储
 sessions = {}
+session_locks = {}
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=100)  # 用于处理IO操作
 
 class ProxyRequest(BaseModel):
     data: str  # Base64编码的数据
@@ -61,17 +67,26 @@ async def establish_connection(proxy_request: ProxyRequest):
         if not all([host, port, session_id]):
             raise ValueError("缺少必要参数")
         
-        # 连接到目标服务器
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.connect((host, int(port)))
+        # 使用线程池异步连接到目标服务器
+        def create_connection():
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # 禁用Nagle算法提高实时性
+            s.connect((host, int(port)))
+            return s
+            
+        server_socket = await asyncio.get_event_loop().run_in_executor(
+            executor, create_connection
+        )
         
-        # 存储会话
+        # 存储会话并创建会话锁
         sessions[session_id] = {
             "socket": server_socket,
             "host": host,
             "port": port,
-            "last_activity": int(time.time())
+            "last_activity": int(time.time()),
+            "buffer": bytearray()
         }
+        session_locks[session_id] = asyncio.Lock()
         
         logger.info(f"已建立到 {host}:{port} 的连接，会话ID: {session_id}")
         
@@ -116,62 +131,75 @@ async def transfer_data(proxy_request: ProxyRequest):
         # 更新最后活动时间
         session["last_activity"] = int(time.time())
         
-        if direction == "to_server":
-            # 解码负载并发送到目标服务器
-            raw_data = base64.b64decode(payload)
-            server_socket.sendall(raw_data)
+        # 使用会话锁确保并发安全
+        async with session_locks[session_id]:
+            if direction == "to_server":
+                # 解码负载并发送到目标服务器
+                raw_data = base64.b64decode(payload)
+                
+                # 使用线程池执行IO操作
+                def send_to_server():
+                    server_socket.sendall(raw_data)
+                    # 从服务器读取响应
+                    response_data = bytearray()
+                    server_socket.settimeout(2.0)  # 设置较短的超时
+                    try:
+                        while True:
+                            chunk = server_socket.recv(16384)  # 增加缓冲区大小
+                            if not chunk:
+                                break
+                            response_data.extend(chunk)
+                            if len(chunk) < 16384:
+                                break
+                    except socket.timeout:
+                        pass
+                    return bytes(response_data)
+                
+                response_data = await asyncio.get_event_loop().run_in_executor(
+                    executor, send_to_server
+                )
+                
+                # 编码响应数据
+                encoded_response = base64.b64encode(response_data).decode('utf-8')
+                
+                return ProxyResponse(data=encode_data({
+                    "status": "success",
+                    "session_id": session_id,
+                    "payload": encoded_response
+                }))
             
-            # 从服务器读取响应
-            response_data = b""
-            server_socket.settimeout(5.0)  # 设置超时
+            elif direction == "from_server":
+                # 仅从服务器读取数据
+                def receive_from_server():
+                    response_data = bytearray()
+                    server_socket.settimeout(0.2)  # 设置非常短的超时以提高响应速度
+                    try:
+                        while True:
+                            chunk = server_socket.recv(16384)
+                            if not chunk:
+                                break
+                            response_data.extend(chunk)
+                            if len(chunk) < 16384:
+                                break
+                    except socket.timeout:
+                        pass
+                    return bytes(response_data)
+                
+                response_data = await asyncio.get_event_loop().run_in_executor(
+                    executor, receive_from_server
+                )
+                
+                # 编码响应数据
+                encoded_response = base64.b64encode(response_data).decode('utf-8')
+                
+                return ProxyResponse(data=encode_data({
+                    "status": "success",
+                    "session_id": session_id,
+                    "payload": encoded_response
+                }))
             
-            try:
-                while True:
-                    chunk = server_socket.recv(8192)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                    if len(chunk) < 8192:  # 如果接收的数据小于缓冲区大小，可能表示数据已接收完毕
-                        break
-            except socket.timeout:
-                pass  # 超时，但我们已经接收了一些数据
-            
-            # 编码响应数据
-            encoded_response = base64.b64encode(response_data).decode('utf-8')
-            
-            return ProxyResponse(data=encode_data({
-                "status": "success",
-                "session_id": session_id,
-                "payload": encoded_response
-            }))
-        
-        elif direction == "from_server":
-            # 仅从服务器读取数据
-            response_data = b""
-            server_socket.settimeout(0.5)  # 设置短超时
-            
-            try:
-                while True:
-                    chunk = server_socket.recv(8192)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                    if len(chunk) < 8192:
-                        break
-            except socket.timeout:
-                pass
-            
-            # 编码响应数据
-            encoded_response = base64.b64encode(response_data).decode('utf-8')
-            
-            return ProxyResponse(data=encode_data({
-                "status": "success",
-                "session_id": session_id,
-                "payload": encoded_response
-            }))
-        
-        else:
-            raise ValueError(f"无效的传输方向: {direction}")
+            else:
+                raise ValueError(f"无效的传输方向: {direction}")
     
     except Exception as e:
         logger.error(f"数据传输失败: {e}")
@@ -183,6 +211,7 @@ async def transfer_data(proxy_request: ProxyRequest):
             status_code=400,
             content={"data": encode_data(response_data)}
         )
+        
 
 @app.post("/close")
 async def close_connection(proxy_request: ProxyRequest):
@@ -196,11 +225,18 @@ async def close_connection(proxy_request: ProxyRequest):
             raise ValueError("缺少必要参数")
         
         if session_id in sessions:
-            session = sessions[session_id]
-            server_socket = session["socket"]
-            server_socket.close()
-            del sessions[session_id]
-            logger.info(f"已关闭会话: {session_id}")
+            # 加锁确保并发安全
+            if session_id in session_locks:
+                async with session_locks[session_id]:
+                    session = sessions[session_id]
+                    server_socket = session["socket"]
+                    await asyncio.get_event_loop().run_in_executor(
+                        executor, lambda: server_socket.close()
+                    )
+                    del sessions[session_id]
+                    logger.info(f"已关闭会话: {session_id}")
+                # 删除会话锁
+                del session_locks[session_id]
         
         return ProxyResponse(data=encode_data({
             "status": "success",
@@ -228,19 +264,25 @@ def cleanup_sessions():
         current_time = int(time.time())
         expired_sessions = []
         
-        for session_id, session in sessions.items():
+        # 复制会话信息避免并发修改
+        current_sessions = dict(sessions)
+        
+        for session_id, session in current_sessions.items():
             # 如果会话超过10分钟没有活动，则关闭
             if current_time - session["last_activity"] > 600:
                 expired_sessions.append(session_id)
         
         for session_id in expired_sessions:
             try:
-                sessions[session_id]["socket"].close()
-                del sessions[session_id]
-                logger.info(f"已清理过期会话: {session_id}")
+                if session_id in sessions:
+                    sessions[session_id]["socket"].close()
+                    del sessions[session_id]
+                    # 同时删除对应的锁
+                    if session_id in session_locks:
+                        del session_locks[session_id]
+                    logger.info(f"已清理过期会话: {session_id}")
             except Exception as e:
                 logger.error(f"清理会话 {session_id} 时出错: {e}")
-
 # 启动清理任务
 cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
 cleanup_thread.start()
